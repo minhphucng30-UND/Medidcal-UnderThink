@@ -1,13 +1,14 @@
 from vllm import LLM, SamplingParams
+import os
 from tqdm import tqdm
 from datasets import Dataset
 import random
 import numpy as np
-from data import load_medical_reasoning_dataset
-ds = load_medical_reasoning_dataset()
+from data import load_mix_dataset
 
 if __name__ == "__main__":
-    llm = LLM("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", enforce_eager=False, max_num_seqs=1024)
+    ds = load_mix_dataset()
+    llm = LLM("models/DeepSeek-R1-0528-Qwen3-8B", enforce_eager=False, max_num_seqs=1024)
     tokenizer = llm.get_tokenizer()
     stop_token_ids = tokenizer("</think>")["input_ids"]
 
@@ -23,10 +24,10 @@ if __name__ == "__main__":
         stop_token_ids=stop_token_ids,
         skip_special_tokens=False,
         min_tokens=0,
-        
     )
+
     MAX_TOKENS_THINKING = 32768
-    NUM_TRIALS = 3
+    NUM_TRIALS = 10
     outputs = llm.generate(chat_prompts, sampling_params=sampling, use_tqdm=True)
     ignore_str = "\nWait"
     max_tokens_thinking_tmp = MAX_TOKENS_THINKING
@@ -62,6 +63,5 @@ if __name__ == "__main__":
     )
     chat_prompts = [chat_prompts[i] + outputs[i].outputs[0].text for i in range(len(chat_prompts))]
     dataset = Dataset.from_dict({"query": prompts, "solution": chat_prompts})
-    import os
     os.makedirs("data/budget_forcing", exist_ok=True)
     dataset.save_to_disk(f"data/budget_forcing/Med-R1-0528-Qwen3-8B-1k-ntrial-{NUM_TRIALS}")

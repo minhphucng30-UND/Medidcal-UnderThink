@@ -7,7 +7,7 @@ from data import load_medical_reasoning_dataset
 ds = load_medical_reasoning_dataset()
 
 if __name__ == "__main__":
-    llm = LLM("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", enforce_eager=False, max_num_seqs=1024)
+    llm = LLM("models/DeepSeek-R1-0528-Qwen3-8B", enforce_eager=False, max_num_seqs=1024)
     tokenizer = llm.get_tokenizer()
     stop_token_ids = tokenizer("</think>")["input_ids"]
 
@@ -15,7 +15,6 @@ if __name__ == "__main__":
     prompts = list(ds['query'])
     random.shuffle(prompts)
     prompts = prompts[:1000]
-    n_tokens = 4096
     sampling = SamplingParams(
         temperature=0.6,
         top_p=0.95,
