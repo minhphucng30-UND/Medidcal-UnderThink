@@ -1,131 +1,82 @@
 import argparse
+import torch
+import numpy as np
+from vllm import LLM, SamplingParams
 from tqdm import tqdm
 import argparse
-import openai
-from jinja2 import Template
 import os
 import json
-from transformers import AutoTokenizer
-from jinja2 import Template
-from scorer import get_results
-
-def postprocess_output(pred):
-    pred = pred.replace("</s>", "")
-    if len(pred) > 0 and pred[0] == " ":
-        pred = pred[1:]
-    return pred
-
-def load_file(input_fp):
-    with open(input_fp, 'r') as f:
-        data = json.load(f)
-    input_data = []
-    if isinstance(data, list):
-        data = {'normal': data}
-    for k,v in data.items():
-        for da in v:
-            da['source'] = k
-        input_data.extend(v)
-    return input_data
+from data import *
+from collect_eval_data import load_huatuo_eval
+from extract_format import extract_answer, huatuo_match_choice
 
 
-def main():
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str,
-                        default="meta-llama/Llama-2-7b-chat-hf")
-    parser.add_argument('--eval_file', type=str, required=True)
-    parser.add_argument('--max_new_tokens', type=int, default=2000)
-    parser.add_argument('--max_tokens', type=int, default=-1)
-    parser.add_argument('--use_chat_template',type=bool, default=True)
-    parser.add_argument('--strict_prompt', action="store_true")
-    parser.add_argument('--task', type=str,default='api')
-    parser.add_argument('--port', type=int, default=30000)
-    parser.add_argument('--batch_size', type=int, default=1024)    
-    args = parser.parse_args()
-
-
-    print(f"Using local API server at port {args.port}")
-    client = openai.Client(
-    base_url=f"http://127.0.0.1:{args.port}/v1", api_key="EMPTY")
-
-    if args.use_chat_template:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, padding_side='left')
-        template = Template(tokenizer.chat_template)
-
-    def call_model(prompts, model, max_new_tokens=50, print_example =False):
-        temperature = 0.5
-        if print_example:
-            print("Example:")
-            print(prompts[1])
-        preds = []
-        if args.use_chat_template:
-            prompts = [template.render(messages=[{"role": "user", "content": prom}],bos_token= tokenizer.bos_token,add_generation_prompt=True) for prom in prompts]
-        
-        if args.max_tokens > 0:
-            new_prompts = []
-            for prompt in prompts:
-                input_ids = tokenizer.encode(prompt,add_special_tokens= False)
-                if len(input_ids) > args.max_tokens:
-                    input_ids = input_ids[:args.max_tokens]
-                    new_prompts.append(tokenizer.decode(input_ids))
-                else:
-                    new_prompts.append(prompt[-args.max_tokens:])
-            prompts = new_prompts
-
-        response = client.completions.create(
-            model="default",
-            prompt=prompts,
-            temperature=temperature, top_p=0.9, max_tokens=max_new_tokens
-        )
-        preds = [x.text for x in response.choices]
-        postprocessed_preds = [postprocess_output(pred) for pred in preds]
-        return postprocessed_preds, preds
-
-    input_data = load_file(args.eval_file)
-    model = None
- 
-    final_results = []
-    if args.strict_prompt:
-        query_prompt = "Please answer the following multiple-choice questions. Please answer the following multiple-choice questions, ensuring your response concludes with the correct option in the format: 'The answer is A.'.\n{question}\n{option_str}"
+def compute_score(output, answer_string, answer_letter, option_str):
+    extracted_answer = extract_answer(output)
+    huatuo_extracted_answer = None
+    correct = False
+    if extracted_answer.lower() == answer_string.lower():
+        correct = True
+    elif extracted_answer.lower() == f"{answer_letter}. {answer_string}".lower():
+        correct = True
+    elif (
+        len(extracted_answer) == 1
+        and extracted_answer.lower() == answer_letter.lower()
+    ):
+        correct = True
     else:
-        query_prompt = "Please answer the following multiple-choice question:\n{question}\n{option_str}"        
+        huatuo_extracted_answer = huatuo_match_choice(extracted_answer, option_str)
+        if huatuo_extracted_answer.lower() == answer_letter.lower():
+            correct = True
+    return correct
 
-    for idx in tqdm(range(len(input_data) // args.batch_size + 1)):
-        batch = input_data[idx*args.batch_size:(idx+1)*args.batch_size]
-        if len(batch) == 0:
-            break
-
-        for item in batch:
-            item['option_str'] = '\n'.join([ f'{op}. {ans}' for op,ans in item['options'].items()])
-            item["input_str"] = query_prompt.format_map(item)
-
-        processed_batch = [ item["input_str"] for item in batch]
-    
-        if idx == 0:
-            print_example = True
-        else:
-            print_example = False
-        
-        preds, _ = call_model(
-            processed_batch, model=model, max_new_tokens=args.max_new_tokens, print_example=print_example)
-
-        for j, item in enumerate(batch):
-            pred = preds[j]
-            if len(pred) == 0:
-                continue
-            item["output"] = pred
-            final_results.append(item)
-
-    task_name = os.path.split(args.model_name)[-1]
-
-    task_name = task_name + os.path.basename(args.eval_file).replace('.json','') + f'_{args.task}' + ('_strict-prompt' if args.strict_prompt else '')
-    save_path = f'{task_name}.json'
-    with open(save_path,'w') as fw:
-        json.dump(final_results,fw,ensure_ascii=False,indent=2)
-
-    # get results
-    get_results(save_path)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="models/gemma-3-4b-pt/m1-sft-epoch9")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max_budget_tokens", type=int, default=16384)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--max_tokens", type=int, default=16384)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    model_path = args.model_path
+    temperature = args.temperature
+    top_p = args.top_p
+    max_tokens = args.max_tokens
+    seed = args.seed
+    eval_data = load_huatuo_eval()
+    metrics = {}
+    metrics['model_path'] = "/".join(model_path.split("/")[1:])
+    print(metrics['model_path'])
+    n_gpus = torch.cuda.device_count()
+    llm = LLM(model_path, enforce_eager=False, max_num_seqs=1024, max_model_len=32768, tensor_parallel_size=n_gpus, gpu_memory_utilization=0.8)
+    sampling_params = SamplingParams(temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, seed=args.seed)
+    metrics['temperature'] = temperature
+    metrics['top_p'] = top_p
+    metrics['max_tokens'] = max_tokens
+    metrics['seed'] = seed
+
+    for k in eval_data.keys():
+        prompts = [ele['question'] for ele in eval_data[k]]
+        answer_idxs = [ele['answer_idx'] for ele in eval_data[k]]
+        answer_strs= [ele['answer'] for ele in eval_data[k]]
+        option_strs = [ele['options'] for ele in eval_data[k]]
+
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        outputs = [output.outputs[0].text for output in outputs]
+        total_scores = 0
+        for output, answer_idx, answer_str, option_str in zip(outputs, answer_idxs, answer_strs, option_strs):
+            score = float(compute_score(output, answer_str, answer_idx, option_str))
+            total_scores += score
+        accuracy = total_scores / len(outputs)
+        metrics[k] = accuracy
+
+    for k in eval_data.keys():
+        print("Accuracy for ", k, ": ", metrics[k])
+    
+    os.makedirs("eval", exist_ok=True)
+    with open("eval/results.json", "a") as f:
+        json.dump(metrics, f)
+        f.write("\n")
